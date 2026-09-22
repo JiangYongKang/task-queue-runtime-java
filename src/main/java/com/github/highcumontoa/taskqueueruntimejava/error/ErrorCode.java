@@ -1,0 +1,27 @@
+package com.github.highcumontoa.taskqueueruntimejava.error;
+
+/**
+ * 稳定且可区分的错误码。任何错误都映射到其中之一，
+ * 禁止以字段缺失导致的不确定行为替代明确拒绝。
+ */
+public enum ErrorCode {
+    TOPIC_NOT_FOUND,
+    GROUP_NOT_FOUND,
+    TOPIC_ALREADY_EXISTS,
+    GROUP_ALREADY_EXISTS,
+    INVALID_CREDENTIAL,
+    PERMISSION_DENIED,
+    CROSS_TOPIC_ACCESS,
+    DUPLICATE_PRODUCER_KEY,
+    QUEUE_FULL,
+    BACKPRESSURE_TIMEOUT,
+    BACKEND_UNAVAILABLE,
+    OPERATION_TIMEOUT,
+    OFFSET_ROLLBACK_REJECTED,
+    CROSS_GROUP_COMMIT_REJECTED,
+    DELIVERY_NOT_FOUND,
+    DELIVERY_STALE,
+    BAD_REQUEST,
+    UNSUPPORTED_FORMAT,
+    RUNTIME_CLOSED
+}
