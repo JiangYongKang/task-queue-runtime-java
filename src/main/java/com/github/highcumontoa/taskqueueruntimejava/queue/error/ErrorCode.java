@@ -1,0 +1,36 @@
+package com.github.highcumontoa.taskqueueruntimejava.queue.error;
+
+/**
+ * 稳定、可区分的错误码。测试与文档均以此为准。
+ */
+public enum ErrorCode {
+    // 通用
+    UNKNOWN_TOPIC,
+    UNKNOWN_GROUP,
+    UNKNOWN_MESSAGE_FORMAT,
+    BACKEND_UNAVAILABLE,
+    // 鉴权
+    INVALID_CREDENTIAL,
+    PERMISSION_DENIED,
+    CROSS_TOPIC_ACCESS_DENIED,
+    // 生产侧背压
+    QUEUE_FULL,
+    PRODUCE_TIMEOUT,
+    BATCH_REJECTED,
+    // 消费侧
+    NO_MESSAGE_AVAILABLE,
+    RECEIVE_TIMEOUT,
+    VISIBILITY_TIMEOUT,
+    UNKNOWN_DELIVERY_TOKEN,
+    OFFSET_ROLLBACK_REJECTED,
+    CROSS_GROUP_COMMIT_REJECTED,
+    OFFSET_OUT_OF_RANGE,
+    ILLEGAL_RESET_TARGET,
+    // 重试/死信
+    RETRY_EXHAUSTED,
+    NON_RETRYABLE,
+    DEAD_MESSAGE_IMMUTABLE,
+    // 生命周期
+    RUNTIME_CLOSED,
+    SHUTDOWN_IN_PROGRESS
+}
