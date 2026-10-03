@@ -24,6 +24,22 @@ public interface TaskQueueRuntime {
     /** 生产消息。producerKey 非空时做生产侧去重，返回既有 messageId。 */
     ProduceReceipt produce(String token, String topic, String body, String producerKey);
 
+    /**
+     * 批量生产：按主题配置的批大小分批落库，逐条返回结论。
+     * 部分失败（如容量满）不回退同批已成功项；失败项携带稳定错误码。
+     * 单次请求条数不得超过 {@link com.github.highcumontoa.taskqueueruntimejava.model.TopicConfig#MAX_BATCH_SIZE}。
+     */
+    com.github.highcumontoa.taskqueueruntimejava.model.BatchProduceResult produceBatch(
+            String token, String topic,
+            java.util.List<com.github.highcumontoa.taskqueueruntimejava.model.ProduceItem> items);
+
+    /**
+     * 批量确认：按主题配置的批大小分批提交，逐条返回结论。
+     * 部分失败（投递陈旧/不存在等）不影响同批其它提交；位点推进遵守连续水位线规则。
+     */
+    com.github.highcumontoa.taskqueueruntimejava.model.BatchCommitResult commitBatch(
+            String token, String topic, String group, java.util.List<String> deliveryIds);
+
     /** 拉取一条可投递消息；无消息返回 null。 */
     Delivery poll(String token, String topic, String group);
 
@@ -55,6 +71,16 @@ public interface TaskQueueRuntime {
 
     /** 驱动一次租约过期/退避到期重投检查（关闭时归还在途消息）。 */
     int reclaimExpired(String topic);
+
+    /**
+     * 回收已彻底终结的消息（所有消费者组均已提交、或已进入死信）。
+     * 仅回收从保留边界开始的连续终结前缀；回收后位点单调不倒退，
+     * 早于保留边界的历史不可再重放（replay 会以 OFFSET_OUT_OF_RETENTION 拒绝）。
+     * 生产路径会自动触发同样的回收，本方法用于手动/定时驱动。
+     *
+     * @return 本次回收的消息条数
+     */
+    int reclaimFinished(String topic);
 
     /** 注册凭据。 */
     void registerCredential(com.github.highcumontoa.taskqueueruntimejava.model.Credential credential);

@@ -6,6 +6,8 @@ import com.github.highcumontoa.taskqueueruntimejava.backend.QueueBackend;
 import com.github.highcumontoa.taskqueueruntimejava.error.ErrorCode;
 import com.github.highcumontoa.taskqueueruntimejava.error.QueueException;
 import com.github.highcumontoa.taskqueueruntimejava.model.BackpressureStrategy;
+import com.github.highcumontoa.taskqueueruntimejava.model.BatchCommitResult;
+import com.github.highcumontoa.taskqueueruntimejava.model.BatchProduceResult;
 import com.github.highcumontoa.taskqueueruntimejava.model.CommitOutcome;
 import com.github.highcumontoa.taskqueueruntimejava.model.CommitResult;
 import com.github.highcumontoa.taskqueueruntimejava.model.Credential;
@@ -16,6 +18,7 @@ import com.github.highcumontoa.taskqueueruntimejava.model.GroupDeliveryState;
 import com.github.highcumontoa.taskqueueruntimejava.model.MessageState;
 import com.github.highcumontoa.taskqueueruntimejava.model.OffsetInfo;
 import com.github.highcumontoa.taskqueueruntimejava.model.Permission;
+import com.github.highcumontoa.taskqueueruntimejava.model.ProduceItem;
 import com.github.highcumontoa.taskqueueruntimejava.model.QueueMessage;
 import com.github.highcumontoa.taskqueueruntimejava.model.TopicConfig;
 import com.github.highcumontoa.taskqueueruntimejava.model.TopicState;
@@ -66,11 +69,49 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
         return credential;
     }
 
-    private static long pendingCount(TopicState state) {
-        return state.getMessages().stream()
-                .filter(m -> m.getState() != MessageState.COMMITTED
-                        && m.getState() != MessageState.DEAD)
-                .count();
+    /**
+     * 回收从保留边界开始的连续“终结前缀”：消息对所有消费者组都已提交
+     * （COMMITTED）或已进入死信（DEAD）即终结。只回收连续前缀，
+     * 保证保留区间 [retainedFromOffset, nextOffset) 始终连续、重放不会悄悄跳洞。
+     * 同步清理各组投递状态、生产者幂等键与对应死信记录，位点单调不倒退。
+     *
+     * @return 本次回收的消息条数
+     */
+    private int reclaimTerminalPrefix(TopicState state) {
+        int removed = 0;
+        long retainedFrom = state.getRetainedFromOffset();
+        while (!state.getMessages().isEmpty()) {
+            QueueMessage head = state.getMessages().get(0);
+            if (head.getState() != MessageState.COMMITTED && head.getState() != MessageState.DEAD) {
+                break;
+            }
+            state.getMessages().remove(0);
+            removed++;
+            retainedFrom = head.getOffset() + 1;
+            for (GroupState g : state.getGroups().values()) {
+                g.getMessages().remove(head.getMessageId());
+            }
+            if (head.getProducerKey() != null) {
+                // 幂等键随消息一并过期：去重保证只覆盖保留窗口。
+                state.getProducerKeyIndex().remove(head.getProducerKey());
+            }
+            state.getDeadLetters().removeIf(dl -> dl.getMessageId().equals(head.getMessageId()));
+        }
+        if (removed > 0) {
+            state.setRetainedFromOffset(retainedFrom);
+            log.info("终结消息已回收 topic={} reclaimed={} retainedFromOffset={}",
+                    state.getName(), removed, retainedFrom);
+        }
+        return removed;
+    }
+
+    /** 保留队列头部是否已终结（可回收）。背压等待的唤醒条件之一。 */
+    private boolean hasReclaimablePrefix(TopicState state) {
+        if (state.getMessages().isEmpty()) {
+            return false;
+        }
+        QueueMessage head = state.getMessages().get(0);
+        return head.getState() == MessageState.COMMITTED || head.getState() == MessageState.DEAD;
     }
 
     @Override
@@ -108,6 +149,13 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
         }
         if (cfg.getCapacity() <= 0) {
             cfg.setCapacity(1000);
+        }
+        // 批大小：非法值回落默认，超过硬上限截断，保证批量路径有界。
+        if (cfg.getBatchSize() <= 0) {
+            cfg.setBatchSize(TopicConfig.DEFAULT_BATCH_SIZE);
+        }
+        if (cfg.getBatchSize() > TopicConfig.MAX_BATCH_SIZE) {
+            cfg.setBatchSize(TopicConfig.MAX_BATCH_SIZE);
         }
         TopicState state = new TopicState();
         state.setName(topic);
@@ -158,19 +206,28 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
                     return new ProduceReceipt(existingId, existing.getOffset(), true);
                 }
             }
-            // 有界背压：容量按未终结消息计，任何情况下都不允许无界增长。
-            if (pendingCount(state) >= state.getConfig().getCapacity()
-                    && state.getConfig().getBackpressureStrategy() == BackpressureStrategy.REJECT) {
-                throw new QueueException(ErrorCode.QUEUE_FULL,
-                        "队列已满 topic=" + state.getName() + "，容量上限 "
-                                + state.getConfig().getCapacity() + "，按 REJECT 策略拒绝生产");
-            }
-            if (!backend.awaitCapacity(topic, backpressureTimeoutMillis,
-                    s -> pendingCount(s) < s.getConfig().getCapacity())) {
-                long waited = state.getConfig().getBackpressureTimeout().toMillis();
-                throw new QueueException(ErrorCode.BACKPRESSURE_TIMEOUT,
-                        "背压等待超时 topic=" + topic + "，超时阈值 " + waited + "ms，容量 "
-                                + state.getConfig().getCapacity());
+            // 有界背压：容量按“保留中的全部消息”计（含已终结待回收），
+            // 任何情况下都不允许无界增长；每次生产前先回收终结前缀，
+            // 使容量上限真实约束长期占用而非某个瞬间的待处理数量。
+            while (true) {
+                reclaimTerminalPrefix(state);
+                if (state.getMessages().size() < state.getConfig().getCapacity()) {
+                    break;
+                }
+                if (state.getConfig().getBackpressureStrategy() == BackpressureStrategy.REJECT) {
+                    throw new QueueException(ErrorCode.QUEUE_FULL,
+                            "队列已满 topic=" + state.getName() + "，容量上限 "
+                                    + state.getConfig().getCapacity() + "，按 REJECT 策略拒绝生产");
+                }
+                // WAIT / BATCH：有界等待容量（提交释放或前缀变为可回收都会唤醒）。
+                if (!backend.awaitCapacity(topic, backpressureTimeoutMillis,
+                        s -> hasReclaimablePrefix(s)
+                                || s.getMessages().size() < s.getConfig().getCapacity())) {
+                    long waited = state.getConfig().getBackpressureTimeout().toMillis();
+                    throw new QueueException(ErrorCode.BACKPRESSURE_TIMEOUT,
+                            "背压等待超时 topic=" + topic + "，超时阈值 " + waited + "ms，容量 "
+                                    + state.getConfig().getCapacity());
+                }
             }
             QueueMessage msg = new QueueMessage();
             msg.setMessageId(UUID.randomUUID().toString());
@@ -193,8 +250,139 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
     }
 
     @Override
-    public Delivery poll(String token, String topic, String group) {
+    public BatchProduceResult produceBatch(String token, String topic, List<ProduceItem> items) {
         checkOpen();
+        auth(token, topic, Permission.PRODUCE);
+        validateBatchRequest(items == null ? 0 : items.size(), "生产");
+        int batchSize = backend.readTopic(topic).getConfig().getBatchSize();
+        long backpressureTimeoutMillis = backend.readTopic(topic)
+                .getConfig().getBackpressureTimeout().toMillis();
+        BatchProduceResult result = new BatchProduceResult();
+        // 按配置的批大小分块，每块在一次主题锁内原子落库；块间不保证整体原子，
+        // 已成功块不回退——部分失败语义以逐条结论表达。
+        for (int from = 0; from < items.size(); from += batchSize) {
+            List<ProduceItem> chunk = items.subList(from, Math.min(from + batchSize, items.size()));
+            int chunkStart = from;
+            backend.mutate(topic, state -> {
+                for (int i = 0; i < chunk.size(); i++) {
+                    result.add(produceOne(state, chunkStart + i, chunk.get(i),
+                            backpressureTimeoutMillis));
+                }
+                return null;
+            });
+        }
+        log.info("批量生产完成 topic={} total={} stored={} duplicate={} rejected={}",
+                topic, items.size(), result.storedCount(), result.duplicateCount(),
+                result.rejectedCount());
+        return result;
+    }
+
+    /** 批量中的单条生产：幂等去重 -> 容量（回收/背压）-> 追加。失败只影响本条。 */
+    private BatchProduceResult.Item produceOne(TopicState state, int index, ProduceItem item,
+                                               long backpressureTimeoutMillis) {
+        String topic = state.getName();
+        String producerKey = item == null ? null : item.getProducerKey();
+        if (producerKey != null && !producerKey.isBlank()) {
+            String existingId = state.getProducerKeyIndex().get(producerKey);
+            if (existingId != null) {
+                QueueMessage existing = findMessage(state, existingId);
+                if (existing != null) {
+                    log.info("批量生产去重命中 topic={} index={} producerKey={} messageId={}",
+                            topic, index, producerKey, existingId);
+                    return new BatchProduceResult.Item(index, BatchProduceResult.ItemStatus.DUPLICATE,
+                            existingId, existing.getOffset(), null, null);
+                }
+            }
+        }
+        while (true) {
+            reclaimTerminalPrefix(state);
+            if (state.getMessages().size() < state.getConfig().getCapacity()) {
+                break;
+            }
+            if (state.getConfig().getBackpressureStrategy() == BackpressureStrategy.REJECT) {
+                return new BatchProduceResult.Item(index, BatchProduceResult.ItemStatus.REJECTED,
+                        null, -1, ErrorCode.QUEUE_FULL,
+                        "队列已满 topic=" + topic + "，容量上限 " + state.getConfig().getCapacity());
+            }
+            // WAIT / BATCH：为该条有界等待容量，超时只失败本条，不影响已成功的同批项。
+            if (!backend.awaitCapacity(topic, backpressureTimeoutMillis,
+                    s -> hasReclaimablePrefix(s)
+                            || s.getMessages().size() < s.getConfig().getCapacity())) {
+                return new BatchProduceResult.Item(index, BatchProduceResult.ItemStatus.REJECTED,
+                        null, -1, ErrorCode.BACKPRESSURE_TIMEOUT,
+                        "背压等待超时 topic=" + topic + "，容量 " + state.getConfig().getCapacity());
+            }
+        }
+        QueueMessage msg = new QueueMessage();
+        msg.setMessageId(UUID.randomUUID().toString());
+        msg.setTopic(topic);
+        msg.setOffset(state.getNextOffset());
+        msg.setBody(item == null ? null : item.getBody());
+        msg.setProducerKey(producerKey);
+        msg.setEnqueueMillis(clock.millis());
+        msg.setAttempt(0);
+        msg.setState(MessageState.AVAILABLE);
+        state.getMessages().add(msg);
+        state.setNextOffset(state.getNextOffset() + 1);
+        if (producerKey != null && !producerKey.isBlank()) {
+            state.getProducerKeyIndex().put(producerKey, msg.getMessageId());
+        }
+        return new BatchProduceResult.Item(index, BatchProduceResult.ItemStatus.STORED,
+                msg.getMessageId(), msg.getOffset(), null, null);
+    }
+
+    private static QueueMessage findMessage(TopicState state, String messageId) {
+        return state.getMessages().stream()
+                .filter(m -> m.getMessageId().equals(messageId)).findFirst().orElse(null);
+    }
+
+    @Override
+    public BatchCommitResult commitBatch(String token, String topic, String group,
+                                         List<String> deliveryIds) {
+        checkOpen();
+        auth(token, topic, Permission.CONSUME);
+        validateBatchRequest(deliveryIds == null ? 0 : deliveryIds.size(), "确认");
+        int batchSize = backend.readTopic(topic).getConfig().getBatchSize();
+        BatchCommitResult result = new BatchCommitResult();
+        for (int from = 0; from < deliveryIds.size(); from += batchSize) {
+            List<String> chunk = deliveryIds.subList(from, Math.min(from + batchSize, deliveryIds.size()));
+            backend.mutate(topic, state -> {
+                GroupState gs = requireGroup(state, group);
+                for (String deliveryId : chunk) {
+                    // 单条失败只记录本条：成功提交不回退，位点仍按连续水位线推进。
+                    try {
+                        CommitResult cr = doCommit(state, gs, deliveryId);
+                        result.add(new BatchCommitResult.Item(deliveryId, cr.getOutcome(),
+                                cr.getMessageId(), cr.getOffset(), null, null));
+                    } catch (QueueException ex) {
+                        log.warn("批量确认单条失败 topic={} group={} deliveryId={} code={}",
+                                state.getName(), group, deliveryId, ex.getCode());
+                        result.add(new BatchCommitResult.Item(deliveryId, null, null, -1,
+                                ex.getCode(), ex.getMessage()));
+                    }
+                }
+                backend.signalCapacity(state.getName());
+                return null;
+            });
+        }
+        inflightCount.addAndGet(-(int) result.successCount());
+        log.info("批量确认完成 topic={} group={} total={} succeeded={} failed={}",
+                topic, group, deliveryIds.size(), result.successCount(), result.failureCount());
+        return result;
+    }
+
+    private static void validateBatchRequest(int size, String what) {
+        if (size <= 0) {
+            throw new QueueException(ErrorCode.BAD_REQUEST, "批量" + what + "请求不能为空");
+        }
+        if (size > TopicConfig.MAX_BATCH_SIZE) {
+            throw new QueueException(ErrorCode.BAD_REQUEST,
+                    "批量" + what + "请求条数超过上限 " + TopicConfig.MAX_BATCH_SIZE + ": " + size);
+        }
+    }
+
+    @Override
+    public Delivery poll(String token, String topic, String group) {        checkOpen();
         auth(token, topic, Permission.CONSUME);
         Delivery delivery = backend.mutate(topic, state ->
                 dispatch(state, requireGroup(state, group)));
@@ -314,10 +502,9 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
         }
         gs.setState(GroupDeliveryState.COMMITTED);
         gs.setCurrentDeliveryId(null);
-        // 位点只能单调推进；显式回退由 replay 负责。
-        if (msg.getOffset() > group.getCommittedOffset()) {
-            group.setCommittedOffset(msg.getOffset());
-        }
+        // 位点是“连续水位线”：只允许推进到所有更早消息都已终结的位置，
+        // 乱序提交（后到的先确认）不会跳过仍在处理中的更早消息。
+        advanceWatermark(state, group);
         idempotencyGuard.commit(msg.getMessageId());
         // 若所有组都已提交，则主题级消息状态终结；有一个组仍待消费则保持在途。
         boolean allCommitted = state.getGroups().values().stream()
@@ -332,6 +519,28 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
                 state.getName(), group.getName(), msg.getMessageId(), msg.getOffset(),
                 group.getCommittedOffset(), gs.getAttempts());
         return new CommitResult(CommitOutcome.COMMITTED, msg.getMessageId(), msg.getOffset());
+    }
+
+    /**
+     * 连续水位线推进：从当前位点起按 offset 升序扫描，逐条越过本组已终结
+     * （COMMITTED，含已死信）的消息，遇到第一条未终结消息即停。
+     * 因此乱序提交时位点不会越过仍在处理中的缺口，缺口补齐后一次性推进；
+     * 位点单调不倒退，显式回退只能走 replay。
+     */
+    private void advanceWatermark(TopicState state, GroupState group) {
+        long watermark = group.getCommittedOffset();
+        for (QueueMessage m : state.getMessages()) {
+            if (m.getOffset() <= watermark) {
+                continue;
+            }
+            GroupMessageState gs = group.getMessages().get(m.getMessageId());
+            if (gs != null && gs.getState() == GroupDeliveryState.COMMITTED) {
+                watermark = m.getOffset();
+            } else {
+                break;
+            }
+        }
+        group.setCommittedOffset(watermark);
     }
 
     private record DeliveryRef(QueueMessage message, GroupMessageState groupMessage) {
@@ -535,7 +744,8 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
             }
         }
         return new OffsetInfo(state.getName(), group.getName(),
-                group.getCommittedOffset(), group.getCommittedOffset() + 1, inflight);
+                group.getCommittedOffset(), group.getCommittedOffset() + 1, inflight,
+                state.getRetainedFromOffset());
     }
 
     @Override
@@ -556,6 +766,15 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
             if (targetOffset == gs.getCommittedOffset()) {
                 throw new QueueException(ErrorCode.OFFSET_ROLLBACK_REJECTED,
                         "重放位点必须早于当前位点（无操作被拒绝）target=" + targetOffset);
+            }
+            // 保留边界：目标区间 (targetOffset, committed] 必须完整落在保留范围内，
+            // 否则重放会悄悄跳过已回收的历史——以独立错误码明确拒绝。
+            if (targetOffset < state.getRetainedFromOffset() - 1) {
+                throw new QueueException(ErrorCode.OFFSET_OUT_OF_RETENTION,
+                        "重放目标位点已超出保留范围：target=" + targetOffset
+                                + "，最早保留位点 retainedFrom=" + state.getRetainedFromOffset()
+                                + "（更早的历史已被回收，无法重放）topic=" + state.getName()
+                                + " group=" + group);
             }
             // 将 (targetOffset, committed] 区间内本组已提交消息重置为可投递。
             for (QueueMessage msg : state.getMessages()) {
@@ -625,6 +844,12 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
         });
         inflightCount.addAndGet(-reclaimed[0]);
         return reclaimed[0];
+    }
+
+    @Override
+    public int reclaimFinished(String topic) {
+        checkOpen();
+        return backend.mutate(topic, this::reclaimTerminalPrefix);
     }
 
     @Override
