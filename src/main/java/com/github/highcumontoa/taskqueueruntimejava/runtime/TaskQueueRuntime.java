@@ -1,5 +1,8 @@
 package com.github.highcumontoa.taskqueueruntimejava.runtime;
 
+import com.github.highcumontoa.taskqueueruntimejava.model.BatchCommitResult;
+import com.github.highcumontoa.taskqueueruntimejava.model.BatchItem;
+import com.github.highcumontoa.taskqueueruntimejava.model.BatchProduceResult;
 import com.github.highcumontoa.taskqueueruntimejava.model.CommitResult;
 import com.github.highcumontoa.taskqueueruntimejava.model.DeadLetterRecord;
 import com.github.highcumontoa.taskqueueruntimejava.model.Delivery;
@@ -23,6 +26,26 @@ public interface TaskQueueRuntime {
 
     /** 生产消息。producerKey 非空时做生产侧去重，返回既有 messageId。 */
     ProduceReceipt produce(String token, String topic, String body, String producerKey);
+
+    /**
+     * 批量生产：逐条结论可区分（ACCEPTED / DUPLICATE / REJECTED）。
+     * 部分失败不回退已成功条目；批大小超过 maxBatchSize 整批拒绝（BATCH_TOO_LARGE）。
+     */
+    BatchProduceResult produceBatch(String token, String topic, List<BatchItem> items);
+
+    /**
+     * 批量提交：逐条结论可区分，成功条目不回退；
+     * 组位点按连续水位推进，不跳过未完成的更早消息。
+     */
+    BatchCommitResult commitBatch(String token, String topic, String group, List<String> deliveryIds);
+
+    /**
+     * 回收已终结（全组提交/死信）且超过保留期的消息与死信记录。
+     * 回收按 offset 前缀推进 baseOffset，位点单调不倒退。
+     *
+     * @return 回收的消息条数
+     */
+    int reclaimTerminated(String topic);
 
     /** 拉取一条可投递消息；无消息返回 null。 */
     Delivery poll(String token, String topic, String group);

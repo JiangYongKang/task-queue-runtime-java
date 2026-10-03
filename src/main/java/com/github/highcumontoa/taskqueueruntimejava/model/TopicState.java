@@ -20,6 +20,8 @@ public final class TopicState {
     private int formatVersion = SUPPORTED_FORMAT_VERSION;
     private TopicConfig config;
     private long nextOffset;
+    /** 保留边界：offset &lt; baseOffset 的消息已被回收，不再可重放。单调不倒退。 */
+    private long baseOffset;
     private final List<QueueMessage> messages = new ArrayList<>();
     private final Map<String, GroupState> groups = new LinkedHashMap<>();
     private final List<DeadLetterRecord> deadLetters = new ArrayList<>();
@@ -33,6 +35,8 @@ public final class TopicState {
     public void setConfig(TopicConfig config) { this.config = config; }
     public long getNextOffset() { return nextOffset; }
     public void setNextOffset(long nextOffset) { this.nextOffset = nextOffset; }
+    public long getBaseOffset() { return baseOffset; }
+    public void setBaseOffset(long baseOffset) { this.baseOffset = baseOffset; }
     public List<QueueMessage> getMessages() { return messages; }
     public Map<String, GroupState> getGroups() { return groups; }
     public List<DeadLetterRecord> getDeadLetters() { return deadLetters; }

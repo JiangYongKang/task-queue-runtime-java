@@ -28,8 +28,10 @@ import java.util.Map;
  * <pre>
  * POST /api/queue/topics/{topic}/groups/{group}          创建组
  * POST /api/queue/topics/{topic}/messages                生产
+ * POST /api/queue/topics/{topic}/messages:batch          批量生产（逐条结论）
  * POST /api/queue/topics/{topic}/groups/{group}/poll     拉取
  * POST /api/queue/topics/{topic}/groups/{group}/commit   提交
+ * POST /api/queue/topics/{topic}/groups/{group}/commit:batch 批量提交（逐条结论）
  * POST /api/queue/topics/{topic}/groups/{group}/nack     失败确认
  * GET  /api/queue/topics/{topic}/groups/{group}/offset   位点
  * POST /api/queue/topics/{topic}/groups/{group}/replay   位点重放
@@ -50,10 +52,17 @@ public class QueueController {
                                     Long backpressureTimeoutMillis,
                                     Long visibilityTimeoutMillis,
                                     Long initialBackoffMillis, Double multiplier,
-                                    Long maxBackoffMillis, Integer maxAttempts) {
+                                    Long maxBackoffMillis, Integer maxAttempts,
+                                    Long retentionMillis, Integer maxBatchSize) {
     }
 
     public record ProduceRequest(String body, String producerKey) {
+    }
+
+    public record BatchProduceRequest(java.util.List<ProduceRequest> items) {
+    }
+
+    public record BatchCommitRequest(java.util.List<String> deliveryIds) {
     }
 
     public record NackRequest(String deliveryId, String error, Boolean retryable) {
@@ -90,7 +99,10 @@ public class QueueController {
                         ? 2000 : req.backpressureTimeoutMillis()),
                 Duration.ofMillis(req.visibilityTimeoutMillis() == null
                         ? 30_000 : req.visibilityTimeoutMillis()),
-                backoff, 1);
+                backoff, 1,
+                Duration.ofMillis(req.retentionMillis() == null
+                        ? 60_000 : req.retentionMillis()),
+                req.maxBatchSize() == null ? 200 : req.maxBatchSize());
     }
 
     @PostMapping("/topics/{topic}/groups/{group}")
@@ -106,6 +118,27 @@ public class QueueController {
             @RequestHeader(value = "X-Queue-Token", required = false) String token,
             @PathVariable String topic, @RequestBody ProduceRequest req) {
         return runtime.produce(token, topic, req.body(), req.producerKey());
+    }
+
+    @PostMapping("/topics/{topic}/messages:batch")
+    public com.github.highcumontoa.taskqueueruntimejava.model.BatchProduceResult produceBatch(
+            @RequestHeader(value = "X-Queue-Token", required = false) String token,
+            @PathVariable String topic, @RequestBody BatchProduceRequest req) {
+        var items = req.items() == null ? java.util.List.<com.github.highcumontoa.taskqueueruntimejava.model.BatchItem>of()
+                : req.items().stream()
+                        .map(p -> new com.github.highcumontoa.taskqueueruntimejava.model.BatchItem(
+                                p.body(), p.producerKey()))
+                        .toList();
+        return runtime.produceBatch(token, topic, items);
+    }
+
+    @PostMapping("/topics/{topic}/groups/{group}/commit:batch")
+    public com.github.highcumontoa.taskqueueruntimejava.model.BatchCommitResult commitBatch(
+            @RequestHeader(value = "X-Queue-Token", required = false) String token,
+            @PathVariable String topic, @PathVariable String group,
+            @RequestBody BatchCommitRequest req) {
+        return runtime.commitBatch(token, topic, group,
+                req.deliveryIds() == null ? java.util.List.of() : req.deliveryIds());
     }
 
     @PostMapping("/topics/{topic}/groups/{group}/poll")

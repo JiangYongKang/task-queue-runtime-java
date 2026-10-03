@@ -13,6 +13,8 @@ public final class QueueMessage {
     private long enqueueMillis;
     private int attempt;
     private MessageState state;
+    /** 主题级终结时刻（全部组提交或进入死信）；保留期据此计算，0 表示未终结。 */
+    private long terminatedAtMillis;
 
     public String getMessageId() { return messageId; }
     public void setMessageId(String messageId) { this.messageId = messageId; }
@@ -30,4 +32,6 @@ public final class QueueMessage {
     public void setAttempt(int attempt) { this.attempt = attempt; }
     public MessageState getState() { return state; }
     public void setState(MessageState state) { this.state = state; }
+    public long getTerminatedAtMillis() { return terminatedAtMillis; }
+    public void setTerminatedAtMillis(long terminatedAtMillis) { this.terminatedAtMillis = terminatedAtMillis; }
 }

@@ -97,4 +97,63 @@ class RestApiTest {
                 String.class);
         assertTrue(again.getBody().contains("ALREADY_COMMITTED"));
     }
+
+    @Test
+    void batchEndpointsOverHttp_partialResultsDistinguishable() {
+        String topic = "rest-batch";
+        String group = "rest-batch-g";
+        // BATCH 策略 + 容量 2 + 批上限 10
+        ResponseEntity<String> topicResp = rest.postForEntity(
+                "/api/queue/topics/" + topic,
+                new HttpEntity<>("{\"capacity\":2,\"backpressureStrategy\":\"BATCH\","
+                                + "\"maxBatchSize\":10}", headers("admin-token")),
+                String.class);
+        assertEquals(HttpStatus.OK, topicResp.getStatusCode(), topicResp.getBody());
+        rest.postForEntity("/api/queue/topics/" + topic + "/groups/" + group,
+                new HttpEntity<>("", headers("admin-token")), String.class);
+
+        // 批量生产 3 条，容量 2：2 收 1 拒，逐条可区分
+        var batchProduce = rest.postForEntity(
+                "/api/queue/topics/" + topic + "/messages:batch",
+                new HttpEntity<>("{\"items\":[{\"body\":\"b0\"},{\"body\":\"b1\"},"
+                                + "{\"body\":\"b2\"}]}", headers("admin-token")),
+                String.class);
+        assertEquals(HttpStatus.OK, batchProduce.getStatusCode(), batchProduce.getBody());
+        assertTrue(batchProduce.getBody().contains("\"acceptedCount\":2"),
+                batchProduce.getBody());
+        assertTrue(batchProduce.getBody().contains("\"rejectedCount\":1"),
+                batchProduce.getBody());
+        assertTrue(batchProduce.getBody().contains("QUEUE_FULL"),
+                "被拒条目必须带可区分错误码: " + batchProduce.getBody());
+
+        // 拉取 2 条并批量提交（混入一个无效投递）：部分失败可区分
+        java.util.List<String> deliveryIds = new java.util.ArrayList<>();
+        for (int i = 0; i < 2; i++) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> d = rest.postForEntity(
+                    "/api/queue/topics/" + topic + "/groups/" + group + "/poll",
+                    new HttpEntity<>("", headers("admin-token")), Map.class).getBody();
+            assertNotNull(d);
+            deliveryIds.add((String) d.get("deliveryId"));
+        }
+        String commitBody = "{\"deliveryIds\":[\"" + deliveryIds.get(0)
+                + "\",\"bogus\",\"" + deliveryIds.get(1) + "\"]}";
+        var batchCommit = rest.postForEntity(
+                "/api/queue/topics/" + topic + "/groups/" + group + "/commit:batch",
+                new HttpEntity<>(commitBody, headers("admin-token")), String.class);
+        assertEquals(HttpStatus.OK, batchCommit.getStatusCode(), batchCommit.getBody());
+        assertTrue(batchCommit.getBody().contains("\"committedCount\":2"),
+                batchCommit.getBody());
+        assertTrue(batchCommit.getBody().contains("\"failedCount\":1"),
+                batchCommit.getBody());
+        assertTrue(batchCommit.getBody().contains("DELIVERY_NOT_FOUND"),
+                batchCommit.getBody());
+
+        // 位点连续推进到 1
+        var offsetWithAuth = rest.exchange(
+                "/api/queue/topics/" + topic + "/groups/" + group + "/offset",
+                HttpMethod.GET, new HttpEntity<>(headers("admin-token")), String.class);
+        assertTrue(offsetWithAuth.getBody().contains("\"committed\":1"),
+                offsetWithAuth.getBody());
+    }
 }

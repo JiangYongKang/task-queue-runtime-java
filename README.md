@@ -5,7 +5,7 @@
 退避重试与死信、位点持久化与显式重放、主题级权限、有界背压，以及
 **内存后端与本地可恢复文件后端的一致语义**。
 
-所有验证均可在本地完成：`mvn test`（24 个用例，无需任何外部依赖）。
+所有验证均可在本地完成：`mvn test`（35 个用例，无需任何外部依赖）。
 
 ---
 
@@ -49,13 +49,45 @@
 
 - 位点语义：初始已提交位点为 **-1**（下一条 offset=0）。commit 只允许
   **单调推进**，位点与消息状态在文件后端持久化，**重启后不跳变、不越位**。
-- **显式重放**（管理员）：`replay(group, targetOffset)` 将
-  `(targetOffset, committed]` 区间的已提交消息重置为可投递并回退位点；
+- **连续水位规则（乱序提交安全）**：并行消费下确认到达顺序常与消息顺序不一致。
+  组位点是"连续水位"——只有当某个位点及其之前的所有消息在本组都已终结
+  （提交或死信）时才前进。后到的消息先确认时，水位停在最早未完成消息之前；
+  该消息确认后，水位一次越过其间已确认的消息。
+  - 重启恢复后从最早未完成消息继续投递：已确认的不重复、中间的不跳过；
+  - 每条消息的投递状态按组独立持久化，水位由状态推导，不依赖提交到达顺序。
+- **显式重放**（管理员）：`replay(group, targetOffset)` 将位点大于
+  `targetOffset` 的本组已提交消息**全部**重置为可投递并回退水位
+  （乱序确认的高于水位的消息同样被覆盖，重放区间完整）；
   允许 `-1` 表示从头重放，重放消息的投递原因为 `REPLAY`。
 - **非法操作被明确拒绝且原因可区分**：
   - 目标位点超过当前位点 → `BAD_REQUEST`（拒绝越位前进）；
   - 目标位点等于当前位点（无变化回退）→ `OFFSET_ROLLBACK_REJECTED`（409）；
+  - 目标位点落出保留边界（更早历史已被回收）→ `OFFSET_COMPACTED`（410），
+    **绝不悄悄跳过已回收历史**；
   - 用其它组的投递提交 → `CROSS_GROUP_COMMIT_REJECTED`（409）。
+
+## 3.1 消息回收与保留边界
+
+长跑主题持续生产/消费/提交后，已彻底终结的消息会被安全回收，占用有界：
+
+- **回收对象**：主题级已终结的消息（所有消费者组都已提交，或已进入死信），
+  以及超过保留期的死信记录。
+- **保留期** `retentionMillis`（默认 1 分钟）：终结后至少保留这么久，
+  期间支持重复提交判定（`ALREADY_COMMITTED`）、生产侧幂等键去重与位点重放。
+- **容量是硬上限**：容量按**保留消息总数**（未终结 + 保留期内的终结消息）计，
+  不再只看瞬间待处理数。容量承压（保留数 ≥ 容量）时，终结消息**不等保留期
+  立即被回收**，因此长期占用始终 ≤ 容量上限。
+- **回收方式**：按 offset 连续前缀推进 `baseOffset`（单调不倒退），
+  同时清理各组投递状态与生产者幂等索引。未终结的更早消息会挡住其后的回收
+  （此时容量背压生效，不会无界增长）。生产/提交/nack 时自动触发回收，
+  也可通过 `reclaimTerminated(topic)` 由定时任务显式驱动。
+- **保留边界的明确结论**：
+  - 重放目标落出保留范围 → `OFFSET_COMPACTED`（410），与正常结果明确区分；
+  - 已回收消息的旧 deliveryId 再提交 → `DELIVERY_NOT_FOUND`
+    （重复提交判定只覆盖保留期）；
+  - 已回收消息的 producerKey 再生产 → 视为新消息（去重只覆盖保留期）。
+- **位点单调性**：`nextOffset`（生产位点）与 `baseOffset`（保留边界）都只增不减，
+  回收后新消息照常生产消费，位点不倒退。
 
 ## 4. 权限模型
 
@@ -72,13 +104,35 @@
 
 ## 5. 有界队列与背压
 
-- 每个主题配置硬性容量上限，按**未终结消息数**计数；任何情况下不允许无界占用内存。
+- 每个主题配置硬性容量上限，按**保留消息总数**计数（见 3.1）；
+  任何情况下不允许无界占用内存。
 - 积压时按主题配置的策略处理：
   - `REJECT`（默认）：立即失败，错误码 `QUEUE_FULL`（HTTP 429）；
   - `WAIT`：在 `backpressureTimeout` 窗口内等待容量，期间释放主题锁，
-    消费者提交释放容量后生产者被唤醒；超时 → `BACKPRESSURE_TIMEOUT`（429）。
+    消费者提交释放容量后生产者被唤醒；超时 → `BACKPRESSURE_TIMEOUT`（429）；
+  - `BATCH`：面向批量导入/批量结算。单条 `produce` 与 REJECT 一致；
+    批量接口按可用容量**尽量接收**，放不下的条目逐条标记失败。
 - 其它稳定可区分错误：`OPERATION_TIMEOUT`（408）、
   `BACKEND_UNAVAILABLE`（503，落盘失败）、`RUNTIME_CLOSED`（503）。
+
+### 5.1 批量策略与部分失败语义
+
+- **批量生产** `produceBatch(token, topic, items)` /
+  `POST /api/queue/topics/{topic}/messages:batch`：
+  逐条结论 `ACCEPTED / DUPLICATE / REJECTED`。
+  积压时放得下的收下（`ACCEPTED`），放不下的该条标记 `REJECTED`
+  （错误码 `QUEUE_FULL`），**已接收条目不因同批失败而回退**；
+  `producerKey` 去重命中返回 `DUPLICATE`（计入接收，不算失败）。
+- **批量提交** `commitBatch(token, topic, group, deliveryIds)` /
+  `POST /api/queue/topics/{topic}/groups/{group}/commit:batch`：
+  逐条结论为 `COMMITTED / ALREADY_COMMITTED` 或失败（携带稳定错误码，
+  如 `DELIVERY_NOT_FOUND` / `DELIVERY_STALE` / `CROSS_GROUP_COMMIT_REJECTED`），
+  失败条目可精确定位到具体 deliveryId，成功条目不回退。
+- **批大小上限** `maxBatchSize`（默认 200，硬上限 1000，越界配置被钳制）：
+  请求超过上限整批拒绝 `BATCH_TOO_LARGE`（400），不产生半批效果。
+- **并发与位点安全**：整批在主题级互斥锁内完成，与并发生产/消费互斥；
+  并发批量提交同一投递只会生效一次（其余幂等返回 `ALREADY_COMMITTED`）；
+  批量提交同样按连续水位推进位点，不跳过未完成消息。
 
 ## 6. 后端替换与格式兼容
 
@@ -112,11 +166,14 @@ mvn test
 mvn test -Dtest=DeliveryAndVisibilityTest   # 重复投递 / 可见性超时 / 幂等
 mvn test -Dtest=RetryAndDeadLetterTest      # 退避重试 / 重试耗尽 / 死信
 mvn test -Dtest=OffsetAndReplayTest         # 位点回退 / 跨组提交 / 重启恢复
+mvn test -Dtest=OutOfOrderCommitTest        # 乱序提交水位 / 重启后从最早未完成恢复
+mvn test -Dtest=RetentionReclaimTest        # 长跑占用有界 / 保留边界 / 死信回收
+mvn test -Dtest=BatchStrategyTest           # 批量生产确认 / 部分失败 / 并发批量
 mvn test -Dtest=AccessControlTest           # 越权 / 无效凭据
 mvn test -Dtest=BackpressureTest            # 背压 REJECT/WAIT
 mvn test -Dtest=ConcurrencyLifecycleTest    # 并发互斥 / 关闭交还
 mvn test -Dtest=BackendCompatibilityTest    # 双后端语义一致 / 旧格式拒绝
-mvn test -Dtest=RestApiTest                 # HTTP 闭环与稳定错误码
+mvn test -Dtest=RestApiTest                 # HTTP 闭环（含批量端点）与稳定错误码
 ```
 
 测试使用可控时钟（`MutableClock`）确定性地推进时间以触发超时/退避；
@@ -171,8 +228,9 @@ curl -s -XPOST localhost:8080/api/queue/topics/orders/groups/workers/poll \
 | INVALID_CREDENTIAL | 401 | 缺失/无法识别的凭据 |
 | CROSS_TOPIC_ACCESS / PERMISSION_DENIED | 403 | 跨主题访问 / 权限不足 |
 | TOPIC_NOT_FOUND / GROUP_NOT_FOUND / DELIVERY_NOT_FOUND | 404 | 资源不存在 |
-| TOPIC_ALREADY_EXISTS / GROUP_ALREADY_EXISTS / BAD_REQUEST / UNSUPPORTED_FORMAT | 400 | 已存在/参数错/旧格式 |
+| TOPIC_ALREADY_EXISTS / GROUP_ALREADY_EXISTS / BAD_REQUEST / UNSUPPORTED_FORMAT / BATCH_TOO_LARGE | 400 | 已存在/参数错/旧格式/批超限 |
 | OFFSET_ROLLBACK_REJECTED / CROSS_GROUP_COMMIT_REJECTED / DELIVERY_STALE | 409 | 非法回退/跨组提交/陈旧投递 |
+| OFFSET_COMPACTED | 410 | 重放目标落出保留边界（历史已回收） |
 | QUEUE_FULL / BACKPRESSURE_TIMEOUT | 429 | 立即满队 / 等待超时 |
 | OPERATION_TIMEOUT | 408 | 操作超时（如等待被中断） |
 | BACKEND_UNAVAILABLE / RUNTIME_CLOSED | 503 | 后端不可用 / 运行时已关闭 |
