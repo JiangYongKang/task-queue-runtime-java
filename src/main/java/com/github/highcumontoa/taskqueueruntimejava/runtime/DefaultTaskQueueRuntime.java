@@ -505,7 +505,7 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
         // 位点是“连续水位线”：只允许推进到所有更早消息都已终结的位置，
         // 乱序提交（后到的先确认）不会跳过仍在处理中的更早消息。
         advanceWatermark(state, group);
-        idempotencyGuard.commit(msg.getMessageId());
+        idempotencyGuard.commit(group.getName(), msg.getMessageId());
         // 若所有组都已提交，则主题级消息状态终结；有一个组仍待消费则保持在途。
         boolean allCommitted = state.getGroups().values().stream()
                 .allMatch(g -> {
@@ -672,7 +672,7 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
         }
         String key = delivery.getMessageId();
         // 已生效（历史重复投递）：不再执行业务，提交结果可区分。
-        if (idempotencyGuard.isApplied(key)) {
+        if (idempotencyGuard.isApplied(group, key)) {
             // 重复投递不重复执行业务，直接按幂等提交终结本次在途投递。
             CommitResult cr = commit(token, topic, group, delivery.getDeliveryId());
             log.info("重复投递短路（业务不重复生效）topic={} group={} messageId={} offset={} attempt={} reason={}",
@@ -680,7 +680,7 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
             return new ProcessResult<>(ProcessResult.Status.ALREADY_PROCESSED, null, cr,
                     key, delivery.getAttempt(), delivery.getReason());
         }
-        if (!idempotencyGuard.begin(key)) {
+        if (!idempotencyGuard.begin(group, key)) {
             // 另一消费者正在处理同一条消息（竞态）：交还本次投递，不生效。
             backend.mutate(topic, state -> releaseInflight(state, group, delivery));
             inflightCount.decrementAndGet();
@@ -691,7 +691,7 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
         try {
             value = handler.apply(delivery);
         } catch (RuntimeException ex) {
-            idempotencyGuard.release(key);
+            idempotencyGuard.release(group, key);
             try {
                 nack(token, topic, group, delivery.getDeliveryId(),
                         String.valueOf(ex.getMessage()), true);
@@ -758,17 +758,29 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
         }
         return backend.mutate(topic, state -> {
             GroupState gs = requireGroup(state, group);
-            if (targetOffset > gs.getCommittedOffset()) {
-                throw new QueueException(ErrorCode.BAD_REQUEST,
-                        "重放目标位点超过当前已提交位点: target=" + targetOffset
+            // 本组“最高已确认位点”：乱序确认下它可能超过对外连续水位线——
+            // 那些位点排在水位线之前、只因中间有未处理完缺口而“超在前面”的消息，
+            // 本组状态已是 COMMITTED，同样必须纳入重放，否则会被静默跳过。
+            long ackedHigh = Long.MIN_VALUE;
+            for (QueueMessage m : state.getMessages()) {
+                GroupMessageState gms = gs.getMessages().get(m.getMessageId());
+                if (gms != null && gms.getState() == GroupDeliveryState.COMMITTED
+                        && m.getOffset() > ackedHigh) {
+                    ackedHigh = m.getOffset();
+                }
+            }
+            // 没有任何已确认消息可重放（或目标已在最高确认之后）：无操作，
+            // 与正常重放明确区分。
+            if (ackedHigh == Long.MIN_VALUE || targetOffset >= ackedHigh) {
+                throw new QueueException(ErrorCode.OFFSET_ROLLBACK_REJECTED,
+                        "重放区间内没有可重新投递的已确认消息（无操作被拒绝）target="
+                                + targetOffset + " ackedHigh="
+                                + (ackedHigh == Long.MIN_VALUE ? "none" : String.valueOf(ackedHigh))
                                 + " committed=" + gs.getCommittedOffset());
             }
-            if (targetOffset == gs.getCommittedOffset()) {
-                throw new QueueException(ErrorCode.OFFSET_ROLLBACK_REJECTED,
-                        "重放位点必须早于当前位点（无操作被拒绝）target=" + targetOffset);
-            }
-            // 保留边界：目标区间 (targetOffset, committed] 必须完整落在保留范围内，
-            // 否则重放会悄悄跳过已回收的历史——以独立错误码明确拒绝。
+            // 保留边界：重放下界必须紧邻保留窗口（targetOffset == retainedFrom-1
+            // 表示从保留窗口第一条开始，合法）。更早的历史已回收，无法保证
+            // 区间内每条都重新投递——明确拒绝，绝不悄悄跳过、绝不返回错位的成功。
             if (targetOffset < state.getRetainedFromOffset() - 1) {
                 throw new QueueException(ErrorCode.OFFSET_OUT_OF_RETENTION,
                         "重放目标位点已超出保留范围：target=" + targetOffset
@@ -776,29 +788,50 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
                                 + "（更早的历史已被回收，无法重放）topic=" + state.getName()
                                 + " group=" + group);
             }
-            // 将 (targetOffset, committed] 区间内本组已提交消息重置为可投递。
+            long now = clock.millis();
+            int reset = 0;
+            // 重放覆盖 (targetOffset, ackedHigh]：区间内本组已终结（COMMITTED）
+            // 的消息全部重置为可投递——既包括水位线以内的连续确认段，
+            // 也包括缺口之前那些“超在前面”的乱序确认消息。
+            // 仍在处理中（INFLIGHT）的缺口消息不在此列：它还有一次未完成的处理，
+            // 由超时重投/正常提交路径收敛，重置反而会制造双重在途。
             for (QueueMessage msg : state.getMessages()) {
-                if (msg.getOffset() > targetOffset && msg.getOffset() <= gs.getCommittedOffset()) {
-                    GroupMessageState gms = gs.getMessages().get(msg.getMessageId());
-                    if (gms != null && gms.getState() == GroupDeliveryState.COMMITTED) {
-                        gms.setState(GroupDeliveryState.AVAILABLE);
-                        gms.setCurrentDeliveryId(null);
-                        gms.setLastDeliveryId(null);
-                        gms.setVisibleUntilMillis(0);
-                        gms.setAvailableAfterMillis(clock.millis());
-                        gms.setReplayPending(true);
-                        gms.setTimeoutReclaimed(false);
-                        if (msg.getState() == MessageState.COMMITTED
-                                || msg.getState() == MessageState.DEAD) {
-                            msg.setState(MessageState.AVAILABLE);
-                        }
-                    }
+                if (msg.getOffset() <= targetOffset || msg.getOffset() > ackedHigh) {
+                    continue;
                 }
+                GroupMessageState gms = gs.getMessages().get(msg.getMessageId());
+                if (gms == null || gms.getState() != GroupDeliveryState.COMMITTED) {
+                    continue;
+                }
+                gms.setState(GroupDeliveryState.AVAILABLE);
+                gms.setCurrentDeliveryId(null);
+                gms.setLastDeliveryId(null);
+                gms.setVisibleUntilMillis(0);
+                gms.setAvailableAfterMillis(now);
+                gms.setReplayPending(true);
+                gms.setTimeoutReclaimed(false);
+                if (msg.getState() == MessageState.COMMITTED
+                        || msg.getState() == MessageState.DEAD) {
+                    msg.setState(MessageState.AVAILABLE);
+                }
+                // 显式重放是“已处理消息允许重新生效”的唯一入口：
+                // 清除本组该消息的消费侧幂等登记，重放投递执行业务时不会被旧记录短路；
+                // 其它组对同一消息的登记不受影响。
+                idempotencyGuard.forget(group, msg.getMessageId());
+                reset++;
             }
+            // 对外位点必须与实际可重新投递情况一致：重算连续终结前缀，
+            // 只可能停在 targetOffset 或其后第一条未终结消息之前，
+            // 绝不会越过任何一条没有重新投递的消息。
             gs.setCommittedOffset(targetOffset);
-            log.warn("位点重放 topic={} group={} newCommittedOffset={}",
-                    state.getName(), group, targetOffset);
-            return buildOffsetInfo(state, gs);
+            advanceWatermark(state, gs);
+            log.warn("位点重放 topic={} group={} target={} ackedHigh={} reset={} committed={}",
+                    state.getName(), group, targetOffset, ackedHigh, reset,
+                    gs.getCommittedOffset());
+            OffsetInfo info = buildOffsetInfo(state, gs);
+            return new OffsetInfo(state.getName(), group, gs.getCommittedOffset(),
+                    info.getNext(), info.getInflight(), info.getEarliestRetained(),
+                    true, targetOffset, ackedHigh, reset);
         });
     }
 

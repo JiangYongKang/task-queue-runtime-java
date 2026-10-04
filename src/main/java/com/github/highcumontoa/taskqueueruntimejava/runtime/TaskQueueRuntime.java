@@ -61,8 +61,16 @@ public interface TaskQueueRuntime {
     OffsetInfo offsetOf(String token, String topic, String group);
 
     /**
-     * 显式位点重放：将已提交位点回退到 targetOffset（管理员权限）。
-     * 普通 commit 回退会被拒绝（OFFSET_ROLLBACK_REJECTED）。
+     * 显式位点重放（管理员权限）：把半开区间 {@code (targetOffset, ackedHigh]} 内
+     * 本组已确认（已提交/已死信）的消息全部重置为可投递，其中 ackedHigh 是本组
+     * 最高已确认位点（乱序确认下可能超过对外连续水位线）；仍在处理中的缺口消息
+     * 不重置。重放后对外位点按连续水位线重算，与实际重新投递严格一致。
+     * 返回的 OffsetInfo 带 {@code replayed/replayFrom/replayHigh/resetCount}，
+     * 可核对本次实际覆盖区间与重置条数。
+     *
+     * <p>结论可区分：参数非法（&lt; -1）-> BAD_REQUEST；区间内无确认可重放
+     * （目标已到/超过最高确认位点）-> OFFSET_ROLLBACK_REJECTED；
+     * 下界落入已回收历史 -> OFFSET_OUT_OF_RETENTION。
      */
     OffsetInfo replay(String token, String topic, String group, long targetOffset);
 

@@ -95,22 +95,31 @@ class OffsetAndReplayTest {
         Delivery d0 = rt.poll(CONSUMER, T, G1);
         rt.commit(CONSUMER, T, G1, d0.getDeliveryId()); // committed=0
 
-        // 目标位点超过当前 -> BAD_REQUEST（越位）
+        // 目标位点超过本组最高已确认位点 -> 区间内没有已确认消息可重放（无操作），
+        // 以 OFFSET_ROLLBACK_REJECTED 与成功重放明确区分。
         QueueException forward = assertThrows(QueueException.class,
                 () -> rt.replay(ADMIN, T, G1, 5));
-        assertEquals(com.github.highcumontoa.taskqueueruntimejava.error.ErrorCode.BAD_REQUEST,
+        assertEquals(com.github.highcumontoa.taskqueueruntimejava.error.ErrorCode.OFFSET_ROLLBACK_REJECTED,
                 forward.getCode());
+        // 非法位点（< -1）-> BAD_REQUEST（参数错误可区分）。
+        QueueException illegal = assertThrows(QueueException.class,
+                () -> rt.replay(ADMIN, T, G1, -2));
+        assertEquals(com.github.highcumontoa.taskqueueruntimejava.error.ErrorCode.BAD_REQUEST,
+                illegal.getCode());
         // 回退到当前位点（无变化）-> OFFSET_ROLLBACK_REJECTED（非法回退可区分）
         QueueException same = assertThrows(QueueException.class,
                 () -> rt.replay(ADMIN, T, G1, 0));
         assertEquals(com.github.highcumontoa.taskqueueruntimejava.error.ErrorCode.OFFSET_ROLLBACK_REJECTED,
                 same.getCode());
-        log.warn("illegal rollbacks rejected group={} forwardCode={} sameOffsetCode={}",
-                G1, forward.getCode(), same.getCode());
+        log.warn("illegal rollbacks rejected group={} noOpCode={} badRequestCode={}",
+                G1, forward.getCode(), illegal.getCode());
 
         // 合法显式回退到 -1：消息以 REPLAY 原因重新投递
         var info = rt.replay(ADMIN, T, G1, -1);
         assertEquals(-1, info.getCommitted());
+        assertEquals(true, info.isReplayed());
+        assertEquals(1, info.getResetCount(), "offset=0 一条已确认消息被重置");
+        assertEquals(0, info.getReplayHigh());
         Delivery redelivered = rt.poll(CONSUMER, T, G1);
         assertNotNull(redelivered);
         assertEquals(DeliveryReason.REPLAY, redelivered.getReason(),

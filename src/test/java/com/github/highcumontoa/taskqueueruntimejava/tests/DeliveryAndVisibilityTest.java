@@ -93,7 +93,7 @@ class DeliveryAndVisibilityTest {
     }
 
     @Test
-    void processTemplate_appliesBusinessExactlyOnceAcrossRedelivery() {
+    void processTemplate_timeoutRedeliveryShortCircuits_butExplicitReplayReapplies() {
         var env = setup(Duration.ofSeconds(30));
         TaskQueueRuntime rt = env.runtime();
         rt.produce(PRODUCER, T, "payload-x", "biz-123");
@@ -107,17 +107,27 @@ class DeliveryAndVisibilityTest {
         });
         assertEquals(TaskQueueRuntime.ProcessResult.Status.APPLIED, r1.getStatus());
 
-        // 模拟位点重放后的重复投递：process 模板必须短路，业务状态不得重复变更。
-        rt.replay(ADMIN, T, G, -1);
+        // 显式重放：需求要求已确认消息必须真正重新投递并重新处理一遍，
+        // 因此重放清除消费侧幂等登记，业务再次生效（APPLIED，而非幂等短路）。
+        var info = rt.replay(ADMIN, T, G, -1);
+        assertEquals(1, info.getResetCount());
         var r2 = rt.process(CONSUMER, T, G, d -> {
             sideEffects.incrementAndGet();
             return "ok-again";
         });
-        assertEquals(TaskQueueRuntime.ProcessResult.Status.ALREADY_PROCESSED, r2.getStatus(),
-                "重复投递必须可区分且业务不重复生效");
-        assertEquals(1, sideEffects.get(), "业务副作用只能发生一次");
-        log.info("redelivery short-circuit messageId={} group={} offset={} attempt={} status={}",
-                r2.getMessageId(), G, r2.getCommitResult() != null ? r2.getCommitResult().getOffset() : -1,
+        assertEquals(TaskQueueRuntime.ProcessResult.Status.APPLIED, r2.getStatus(),
+                "显式重放的重新投递必须让业务重新生效，不能被旧的幂等记录短路");
+        assertEquals(2, sideEffects.get(),
+                "显式重放是“已处理消息允许再次生效”的唯一入口，此处应发生第二次副作用");
+        assertEquals(DeliveryReason.REPLAY, r2.getReason());
+        log.info("replay re-applied messageId={} group={} offset={} attempt={} status={}",
+                r2.getMessageId(), G,
+                r2.getCommitResult() != null ? r2.getCommitResult().getOffset() : -1,
                 r2.getAttempt(), r2.getStatus());
+
+        // 重放这轮提交完成后，没有新的重放指令也没有超时，因此不存在额外投递，
+        // 业务副作用停在 2 次（非显式重放的重复到达仍由幂等保护，见可见性超时用例）。
+        assertNull(rt.poll(CONSUMER, T, G), "重放轮提交完成后没有新的重复投递");
+        assertEquals(2, sideEffects.get(), "无重放指令时业务副作用停在 2 次");
     }
 }
