@@ -9,13 +9,16 @@
 
 - **乱序提交位点安全**：消费位点是“连续水位线”，并发消费下后到的消息先确认
   也不会跳过仍在处理中的更早消息；重启后从最早未完成的消息继续投递。
+- **乱序确认下的重放覆盖完整**：显式重放的覆盖上界取本组实际已确认的最大
+  位点（含超在水位线之前的已确认消息），从头重放不会漏投任何一条；
+  重放后对外进度与实际重新投递一致，且与超时重投、重启恢复组合安全。
 - **终结消息回收与保留边界**：被所有消费者组处理完或已进入死信的消息会被
   安全回收，容量上限真实约束长期占用；对已清出保留范围的历史重放会以
   独立错误码明确拒绝。
 - **批量策略**：新增 `BATCH` 背压策略与批量生产/批量确认 API，按可配置
   批大小成批处理，部分失败逐条可区分且成功项不回退。
 
-所有验证均可在本地完成：`mvn test`（37 个用例，无需任何外部依赖）。
+所有验证均可在本地完成：`mvn test`（40 个用例，无需任何外部依赖）。
 
 ---
 
@@ -67,12 +70,25 @@
   - 进程重启恢复后，从最早那条未完成的消息继续投递，已确认的不重复、
     中间的任何一条都不会被永久跳过。
 - **显式重放**（管理员）：`replay(group, targetOffset)` 将
-  `(targetOffset, committed]` 区间的已提交消息重置为可投递并回退位点；
+  `(targetOffset, maxCommitted]` 区间内本组已确认的消息重置为可投递并回退位点；
   允许 `-1` 表示从头重放（受保留边界约束，见第 6 节），
   重放消息的投递原因为 `REPLAY`。
+- **重放覆盖区间与乱序确认的关系**：上界 `maxCommitted` 取本组**实际已确认的
+  最大位点**，而不是对外连续水位线。乱序确认时，某些已确认消息的位点会
+  “超在”水位线之前（中间还有未处理完的缺口）；这些消息同样在重放覆盖
+  区间内，会被重新投递，**不会因排在对外进度之前而被静默跳过**。
+  仍在处理中（在途）的消息不属于重放范围，其在途投递保持有效，
+  确认后按连续水位线规则并入进度。
+- **重放后进度与实际重新投递一致**：重放把位点回退到 `targetOffset`，
+  此后随着重放投递被逐条确认，水位线从该点重新单调推进（只增不减）；
+  只有真正被重新投递并确认的消息才会计入进度，不会出现“进度追过去了、
+  某条其实没被重新投递”的错位。重放待投状态随文件后端持久化，
+  **重放进行到一半重启**，恢复后未完成的重放投递会继续完成。
+- **重放与消费幂等**：重放只保证“重新投递”。`process` 模板对已生效消息
+  仍短路为 `ALREADY_PROCESSED`，业务副作用不因重放重复生效。
 - **非法操作被明确拒绝且原因可区分**：
-  - 目标位点超过当前位点 → `BAD_REQUEST`（拒绝越位前进）；
-  - 目标位点等于当前位点（无变化回退）→ `OFFSET_ROLLBACK_REJECTED`（409）；
+  - 目标位点超过本组实际已确认的最大位点 → `BAD_REQUEST`（拒绝越位前进）；
+  - 目标位点等于该上界（无变化回退）→ `OFFSET_ROLLBACK_REJECTED`（409）；
   - 目标区间包含已被回收的历史 → `OFFSET_OUT_OF_RETENTION`（409）；
   - 用其它组的投递提交 → `CROSS_GROUP_COMMIT_REJECTED`（409）。
 
@@ -132,7 +148,7 @@
 - **位点单调不倒退**：回收只删除已终结消息，`nextOffset` 与各组
   committedOffset 不回退、offset 不重用；新消息照常生产消费。
 - **保留边界与重放**：`OffsetInfo.earliestRetained` 暴露当前最早保留位点。
-  `replay(targetOffset)` 要求区间 `(targetOffset, committed]` 完整落在保留
+  `replay(targetOffset)` 要求区间 `(targetOffset, maxCommitted]` 完整落在保留
   范围内，否则以 `OFFSET_OUT_OF_RETENTION`（409）**明确拒绝**——
   与正常重放、无变化回退（`OFFSET_ROLLBACK_REJECTED`）都可区分，
   不会悄悄跳过已回收的历史，也不会返回看似成功实则错位的结果。
@@ -175,6 +191,7 @@ mvn test -Dtest=DeliveryAndVisibilityTest   # 重复投递 / 可见性超时 / �
 mvn test -Dtest=RetryAndDeadLetterTest      # 退避重试 / 重试耗尽 / 死信
 mvn test -Dtest=OffsetAndReplayTest         # 位点回退 / 跨组提交 / 重启恢复
 mvn test -Dtest=OutOfOrderCommitTest        # 乱序提交水位线 / 乱序后重启续投 / 缺口重放
+mvn test -Dtest=ReplayAfterOutOfOrderCommitTest  # 乱序确认后重放覆盖 / 重放与确认交错 / 重放后重启恢复
 mvn test -Dtest=RetentionTest               # 长跑占用有界 / 保留边界 / 死信回收
 mvn test -Dtest=BatchStrategyTest           # 批量生产确认 / 部分失败 / 批大小上限
 mvn test -Dtest=AccessControlTest           # 越权 / 无效凭据

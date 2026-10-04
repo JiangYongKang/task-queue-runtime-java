@@ -62,6 +62,10 @@ public interface TaskQueueRuntime {
 
     /**
      * 显式位点重放：将已提交位点回退到 targetOffset（管理员权限）。
+     * 覆盖区间为 (targetOffset, maxCommitted]，其中 maxCommitted 是本组
+     * 实际已确认的最大位点——乱序确认下它可能超在对外连续水位线之前，
+     * 这部分已确认消息同样会被重置并重新投递，不会被静默跳过。
+     * 仍在处理中（在途）的消息不属于重放范围，其在途投递保持有效。
      * 普通 commit 回退会被拒绝（OFFSET_ROLLBACK_REJECTED）。
      */
     OffsetInfo replay(String token, String topic, String group, long targetOffset);

@@ -543,6 +543,25 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
         group.setCommittedOffset(watermark);
     }
 
+    /**
+     * 本组实际已确认的最大位点：连续水位线与所有组内已终结（COMMITTED，
+     * 含已死信）消息位点的最大值。乱序确认时后者可能超在水位线之前，
+     * 显式重放的覆盖上界必须以它为准，否则会漏投这部分消息。
+     */
+    private long maxCommittedOffset(TopicState state, GroupState group) {
+        long max = group.getCommittedOffset();
+        for (QueueMessage m : state.getMessages()) {
+            if (m.getOffset() <= max) {
+                continue;
+            }
+            GroupMessageState gs = group.getMessages().get(m.getMessageId());
+            if (gs != null && gs.getState() == GroupDeliveryState.COMMITTED) {
+                max = m.getOffset();
+            }
+        }
+        return max;
+    }
+
     private record DeliveryRef(QueueMessage message, GroupMessageState groupMessage) {
     }
 
@@ -758,16 +777,20 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
         }
         return backend.mutate(topic, state -> {
             GroupState gs = requireGroup(state, group);
-            if (targetOffset > gs.getCommittedOffset()) {
+            // 乱序确认下，已确认消息的位点可能“超在”连续水位线之前（中间有仍在
+            // 处理中的缺口）。重放的上界必须覆盖这些已确认消息，否则它们会被
+            // 静默跳过：对外进度追过去了，实际却没有重新投递。
+            long maxCommitted = maxCommittedOffset(state, gs);
+            if (targetOffset > maxCommitted) {
                 throw new QueueException(ErrorCode.BAD_REQUEST,
                         "重放目标位点超过当前已提交位点: target=" + targetOffset
-                                + " committed=" + gs.getCommittedOffset());
+                                + " committed=" + maxCommitted);
             }
-            if (targetOffset == gs.getCommittedOffset()) {
+            if (targetOffset == maxCommitted) {
                 throw new QueueException(ErrorCode.OFFSET_ROLLBACK_REJECTED,
                         "重放位点必须早于当前位点（无操作被拒绝）target=" + targetOffset);
             }
-            // 保留边界：目标区间 (targetOffset, committed] 必须完整落在保留范围内，
+            // 保留边界：目标区间 (targetOffset, maxCommitted] 必须完整落在保留范围内，
             // 否则重放会悄悄跳过已回收的历史——以独立错误码明确拒绝。
             if (targetOffset < state.getRetainedFromOffset() - 1) {
                 throw new QueueException(ErrorCode.OFFSET_OUT_OF_RETENTION,
@@ -776,9 +799,12 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
                                 + "（更早的历史已被回收，无法重放）topic=" + state.getName()
                                 + " group=" + group);
             }
-            // 将 (targetOffset, committed] 区间内本组已提交消息重置为可投递。
+            // 将 (targetOffset, maxCommitted] 区间内本组已提交消息重置为可投递——
+            // 上界按“本组实际已确认的最大位点”取，而不是对外水位线，因此乱序确认中
+            // 超在水位线之前的已确认消息同样会被重新投递，不会被静默跳过。
+            int resetCount = 0;
             for (QueueMessage msg : state.getMessages()) {
-                if (msg.getOffset() > targetOffset && msg.getOffset() <= gs.getCommittedOffset()) {
+                if (msg.getOffset() > targetOffset && msg.getOffset() <= maxCommitted) {
                     GroupMessageState gms = gs.getMessages().get(msg.getMessageId());
                     if (gms != null && gms.getState() == GroupDeliveryState.COMMITTED) {
                         gms.setState(GroupDeliveryState.AVAILABLE);
@@ -788,6 +814,10 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
                         gms.setAvailableAfterMillis(clock.millis());
                         gms.setReplayPending(true);
                         gms.setTimeoutReclaimed(false);
+                        // 注意：不清除消费侧幂等记录。重放只保证“重新投递”，
+                        // process 模板对已生效消息仍短路为 ALREADY_PROCESSED，
+                        // 业务副作用不因重放重复生效。
+                        resetCount++;
                         if (msg.getState() == MessageState.COMMITTED
                                 || msg.getState() == MessageState.DEAD) {
                             msg.setState(MessageState.AVAILABLE);
@@ -796,8 +826,9 @@ public class DefaultTaskQueueRuntime implements TaskQueueRuntime {
                 }
             }
             gs.setCommittedOffset(targetOffset);
-            log.warn("位点重放 topic={} group={} newCommittedOffset={}",
-                    state.getName(), group, targetOffset);
+            log.warn("位点重放 topic={} group={} newCommittedOffset={} resetMessages={} "
+                            + "（上界含乱序确认超在水位线之前的已确认消息 maxCommitted={}）",
+                    state.getName(), group, targetOffset, resetCount, maxCommitted);
             return buildOffsetInfo(state, gs);
         });
     }
